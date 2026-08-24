@@ -20,7 +20,16 @@ module csi2_rx_llp_sf #(
     output reg         crc_error,
 
     output reg  [7:0]  data_id,
-    output reg         packet_done
+    output reg         packet_done,
+
+    // External FIFO Interface
+    output wire        fifo_wr,
+    output wire [7:0]  fifo_wdata,
+    input  wire        fifo_full,
+    output wire        fifo_rd,
+    input  wire [7:0]  fifo_dout,
+    input  wire        fifo_empty,
+    output reg         fifo_flush
 );
 
 // FSM states
@@ -81,31 +90,11 @@ crc16_1021 crc_core(
     .crc_out(crc_calc)
 );
 
-// Internal FIFO signals
-wire fifo_full;
-wire fifo_empty;
-wire fifo_wr = (state == PAYLOAD) && phy_valid && vc_match;
-wire fifo_rd;
-reg  fifo_flush;
-wire [7:0] fifo_dout;
-
-assign fifo_rd = axi_active && m_axis_tvalid && m_axis_tready;
-
-// Instantiate internal Synchronous FIFO for Store-and-Forward buffering
-sync_fifo #(
-    .DEPTH(4096),
-    .ADDR_WIDTH(12)
-) fifo (
-    .clk(clk),
-    .rst_n(rst_n),
-    .wr_en(fifo_wr),
-    .wr_data(phy_byte),
-    .full(fifo_full),
-    .rd_en(fifo_rd),
-    .rd_data(fifo_dout),
-    .empty(fifo_empty),
-    .flush(fifo_flush)
-);
+// External FIFO Control Assignments
+assign fifo_wr    = (state == PAYLOAD) && phy_valid && vc_match;
+assign fifo_wdata = phy_byte;
+assign fifo_rd    = (state == AXI_STREAM && !fifo_empty && word_count > 0) ||
+                    (axi_active && !(m_axis_tvalid && !m_axis_tready) && (axi_out_cnt + 1 < axi_out_word_count));
 
 // AXI Output Count
 reg [15:0] axi_out_cnt;
