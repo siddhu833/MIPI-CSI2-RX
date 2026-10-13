@@ -1,0 +1,14 @@
+rtl/cdc/D_flipflop.v
+rtl/cdc/2ff_sync.v
+rtl/cdc/w_ptr_handler.v
+rtl/cdc/rd_ptr_hdlr.v
+rtl/cdc/asyncc_fifo.v
+rtl/rst_sync.v
+rtl/axis_async_fifo.v
+rtl/crc16_1021.v
+rtl/csi2_ecc_gen.v
+rtl/csi2_ecc_rx.v
+rtl/csi2_tx_packer.v
+rtl/csi2_rx_llp.v
+rtl/csi2_rx_axis_bridge.v
+rtl/csi2_loopback_top.v

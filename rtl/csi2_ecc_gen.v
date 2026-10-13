@@ -1,22 +1,18 @@
+`timescale 1ns / 1ps
 // ============================================================================
-// csi2_ecc_gen.v
-// Combinational CSI-2 Header ECC Generator (TX side)
+// csi2_ecc_gen.v - CSI-2 packet header ECC generator (TX side)
 //
-// Generates the 6-bit ECC parity for a 26-bit header data word.
-// Uses IDENTICAL parity equations as csi2_ecc_rx.v so the RX checker
-// will always see syndrome = 6'b000000 (ecc_ok = 1) on correct packets.
-//
-// Port:
-//   data_in [25:0] = {reserved[25:22], WC_MSB[21:16], WC_LSB[15:8], DI[7:0]}
-//   ecc_out  [5:0] = generated ECC parity bits (put into header byte 4)
+// 6-bit Hamming parity over the 24-bit packet header {WC, DI}.
+//   data_in[25:0] = {4'b0, WC[13:8], WC[7:0], DI[7:0]}
+// Uses the same parity equations as csi2_ecc_rx, so a clean header gives
+// syndrome 0 at the receiver.
 // ============================================================================
 
 module csi2_ecc_gen (
-    input  wire [25:0] data_in,   // {2'b00, WC_MSB[5:0], WC_LSB[7:0], DI[7:0]}
-    output wire  [5:0] ecc_out    // Generated ECC — identical equations to RX checker
+    input  wire [25:0] data_in,
+    output wire [5:0]  ecc_out
 );
 
-    // Same parity equations as csi2_ecc_rx so syndrome = 0 on valid packets
     assign ecc_out[0] = data_in[0]  ^ data_in[1]  ^ data_in[3]  ^
                         data_in[4]  ^ data_in[6]  ^ data_in[8]  ^
                         data_in[10] ^ data_in[11] ^ data_in[13] ^

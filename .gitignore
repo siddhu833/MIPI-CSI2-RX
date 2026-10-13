@@ -1,22 +1,14 @@
-# Simulation artifacts
-sim/
-*.vvp
+# Simulation / tool output
+sim_data/
 *.vcd
+*.wdb
 *.log
 *.jou
-*.txt
-
-# Vivado artifacts
+xsim.dir/
+work/
+transcript
+vsim.wlf
+# Vivado / JasperGold
 .Xil/
-*.cache/
-*.hw/
-*.ip_user_files/
-*.runs/
-*.sim/
-*.xpr
-*.pb
-*.wcfg
-
-# OS artifacts
-.DS_Store
-Thumbs.db
+vivado/
+jgproject/

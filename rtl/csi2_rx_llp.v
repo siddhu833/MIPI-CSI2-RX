@@ -1,197 +1,267 @@
-`timescale 1ns/1ps
+`timescale 1ns / 1ps
+// ============================================================================
+// csi2_rx_llp.v - CSI-2 RX low-level protocol (cut-through)
+//
+//  * Captures the 4-byte packet header, checks/corrects it with ECC
+//      - single-bit error : corrected, packet accepted (ecc_corrected)
+//      - multi-bit error  : packet discarded until end of burst (ecc_error)
+//  * Short packets: Frame Start / Frame End
+//  * Long packets : payload forwarded byte by byte (cut-through) while the
+//    CRC-16 is computed on the fly; the received CRC is compared at the end
+//  * The last payload byte is held back by one stage so it can be tagged
+//    with the CRC result: out_last=1 and out_err=1 on a bad line
+//  * phy_valid low = end of HS burst: an unfinished packet is closed and
+//    reported on pkt_truncated
+// ============================================================================
 
-// CSI-2 RX module WITH ECC - using the proven idle_wait fix
 module csi2_rx_llp (
     input  wire        clk,
     input  wire        rst_n,
 
-    // PHY byte stream
     input  wire [7:0]  phy_byte,
     input  wire        phy_valid,
 
-    // AXI-Stream output
-    output reg  [7:0]  m_axis_tdata,
-    output reg         m_axis_tvalid,
-    input  wire        m_axis_tready,
-    output reg         m_axis_tlast,
+    // payload byte stream
+    output reg  [7:0]  out_data,
+    output reg         out_valid,
+    output reg         out_last,     // last byte of a line
+    output reg         out_sof,      // first byte of a frame
+    output reg         out_err,      // line failed CRC / was truncated (with out_last)
 
-    // Status
-    output reg         ecc_ok,
+    // header / status (1-cycle pulses unless noted)
+    output reg  [7:0]  data_id,      // last accepted DI (level)
+    output reg  [15:0] word_count,   // last accepted WC (level)
+    output reg         frame_start,
+    output reg         frame_end,
+    output reg         line_done,
     output reg         ecc_corrected,
     output reg         ecc_error,
-    output reg  [7:0]  data_id,
-    output reg         packet_done
+    output reg         crc_error,
+    output reg         pkt_truncated
 );
 
-    // ---------------- STATES ----------------
-    localparam IDLE        = 3'd0;
-    localparam HEADER      = 3'd1;
-    localparam WAIT_ECC    = 3'd2;
-    localparam PAYLOAD     = 3'd3;
+    localparam [7:0] DI_FS = 8'h00;
+    localparam [7:0] DI_FE = 8'h01;
 
-    reg [2:0] state;
+    localparam [2:0] S_IDLE    = 3'd0;
+    localparam [2:0] S_HDR     = 3'd1;
+    localparam [2:0] S_PAYLOAD = 3'd2;
+    localparam [2:0] S_CRC_LSB = 3'd3;
+    localparam [2:0] S_CRC_MSB = 3'd4;
+    localparam [2:0] S_DISCARD = 3'd5;
 
-    // ---------------- COUNTERS ----------------
-    reg [2:0]  hdr_cnt;
-    reg [15:0] byte_cnt;
-    reg [15:0] word_count;
+    reg [2:0]  state;
+    reg [1:0]  hdr_cnt;
+    reg [7:0]  hdr_b0, hdr_b1, hdr_b2;
+    reg [15:0] pay_cnt;
+    reg [15:0] wc_q;
+    reg [7:0]  crc_lsb;
+    reg        sof_pending;
 
-    // ---------------- HEADER BYTES ----------------
-    reg [7:0] hdr_b0, hdr_b1, hdr_b2, hdr_b3;
-    
-    // ✅ Flag to wait one cycle in IDLE before capturing next packet
-    reg idle_wait;
+    // one-byte hold stage
+    reg [7:0]  pend_data;
+    reg        pend_valid;
+    reg        pend_sof;
 
-    // ---------------- ECC ----------------
-    wire [25:0] ecc_data_in;
-    wire [25:0] ecc_data_corr;
-    wire [5:0]  ecc_rx;
-    wire        ecc_ok_wire, ecc_corrected_wire, ecc_error_wire;
+    // ------------------------------------------------------------------------
+    // Header ECC (4th header byte is the live phy_byte)
+    // ------------------------------------------------------------------------
+    wire [25:0] hdr_corr;
+    wire        ecc_ok_w, ecc_corr_w, ecc_err_w;
 
-    assign ecc_data_in = {hdr_b2[5:0], hdr_b1, hdr_b0};
-    assign ecc_rx      = hdr_b3[5:0];
-
-    csi2_ecc_rx ecc_checker (
-        .data_in       (ecc_data_in),
-        .ecc_rx        (ecc_rx),
-        .data_corr     (ecc_data_corr),
-        .ecc_ok        (ecc_ok_wire),
-        .ecc_corrected (ecc_corrected_wire),
-        .ecc_error     (ecc_error_wire)
+    csi2_ecc_rx u_ecc (
+        .data_in       ({4'b0, hdr_b2[5:0], hdr_b1, hdr_b0}),
+        .ecc_rx        (phy_byte[5:0]),
+        .data_corr     (hdr_corr),
+        .ecc_ok        (ecc_ok_w),
+        .ecc_corrected (ecc_corr_w),
+        .ecc_error     (ecc_err_w)
     );
 
-    // ECC-corrected fields
-    wire [7:0] corr_data_id = ecc_data_corr[7:0];
-    wire [7:0] corr_wc_lsb  = ecc_data_corr[15:8];
-    wire [5:0] corr_wc_msb  = ecc_data_corr[21:16];
+    wire [7:0]  hdr_di   = hdr_corr[7:0];
+    wire [15:0] hdr_wc   = {2'b00, hdr_corr[21:8]};
+    wire        hdr_last = (state == S_HDR) && (hdr_cnt == 2'd3) && phy_valid;
+    wire        is_long  = (hdr_di >= 8'h10);
 
-    // ---------------- FSM ----------------
+    // ------------------------------------------------------------------------
+    // Payload CRC
+    // ------------------------------------------------------------------------
+    wire [15:0] crc_calc;
+
+    crc16_1021 u_crc (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .init       (hdr_last),
+        .data_valid ((state == S_PAYLOAD) && phy_valid),
+        .data_in    (phy_byte),
+        .crc_out    (crc_calc)
+    );
+
+    wire crc_bad = ({phy_byte, crc_lsb} != crc_calc);
+
+    // ------------------------------------------------------------------------
+    // FSM
+    // ------------------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state          <= IDLE;
-            hdr_cnt        <= 0;
-            byte_cnt       <= 0;
-            word_count     <= 0;
-            data_id        <= 0;
-            packet_done    <= 0;
-            m_axis_tdata   <= 0;
-            m_axis_tvalid  <= 0;
-            m_axis_tlast   <= 0;
-            hdr_b0 <= 0; hdr_b1 <= 0; hdr_b2 <= 0; hdr_b3 <= 0;
-            idle_wait <= 0;
-            ecc_ok        <= 0;
-            ecc_corrected <= 0;
-            ecc_error     <= 0;
+            state         <= S_IDLE;
+            hdr_cnt       <= 2'd0;
+            hdr_b0        <= 8'd0;
+            hdr_b1        <= 8'd0;
+            hdr_b2        <= 8'd0;
+            pay_cnt       <= 16'd0;
+            wc_q          <= 16'd0;
+            crc_lsb       <= 8'd0;
+            sof_pending   <= 1'b0;
+            pend_data     <= 8'd0;
+            pend_valid    <= 1'b0;
+            pend_sof      <= 1'b0;
+            out_data      <= 8'd0;
+            out_valid     <= 1'b0;
+            out_last      <= 1'b0;
+            out_sof       <= 1'b0;
+            out_err       <= 1'b0;
+            data_id       <= 8'd0;
+            word_count    <= 16'd0;
+            frame_start   <= 1'b0;
+            frame_end     <= 1'b0;
+            line_done     <= 1'b0;
+            ecc_corrected <= 1'b0;
+            ecc_error     <= 1'b0;
+            crc_error     <= 1'b0;
+            pkt_truncated <= 1'b0;
         end else begin
-            // defaults
-            m_axis_tvalid  <= 0;
-            m_axis_tlast   <= 0;
-            packet_done    <= 0;
-            ecc_ok        <= 0;
-            ecc_corrected <= 0;
-            ecc_error     <= 0;
+            out_valid     <= 1'b0;
+            out_last      <= 1'b0;
+            out_sof       <= 1'b0;
+            out_err       <= 1'b0;
+            frame_start   <= 1'b0;
+            frame_end     <= 1'b0;
+            line_done     <= 1'b0;
+            ecc_corrected <= 1'b0;
+            ecc_error     <= 1'b0;
+            crc_error     <= 1'b0;
+            pkt_truncated <= 1'b0;
 
             case (state)
-
-            // ---------------- IDLE ----------------
-            IDLE: begin
-                hdr_cnt    <= 0;
-                byte_cnt   <= 0;
-                word_count <= 0;
-
-                // ✅ Wait one cycle before capturing next packet
-                if (idle_wait) begin
-                    idle_wait <= 0;  // Clear wait flag
-                end else if (phy_valid) begin
-                    hdr_b0  <= phy_byte;  // Data ID
-                    hdr_cnt <= 1;
-                    state   <= HEADER;
+                S_IDLE: begin
+                    if (phy_valid) begin
+                        hdr_b0  <= phy_byte;
+                        hdr_cnt <= 2'd1;
+                        state   <= S_HDR;
+                    end
                 end
-            end
 
-            // ---------------- HEADER ----------------
-            HEADER: begin
-                if (phy_valid) begin
-                    case (hdr_cnt)
-                        1: begin 
-                            hdr_b1 <= phy_byte;  // Word Count LSB
-                            hdr_cnt <= 2; 
-                        end
-                        2: begin 
-                            hdr_b2 <= phy_byte;  // Word Count MSB
-                            hdr_cnt <= 3; 
-                        end
-                        3: begin
-                            hdr_b3 <= phy_byte;  // ECC byte
-                            hdr_cnt <= 0;
-                            state <= WAIT_ECC;
-                        end
-                    endcase
-                end
-            end
-
-            // ---------------- WAIT_ECC ----------------
-            WAIT_ECC: begin
-                ecc_ok        <= ecc_ok_wire;
-                ecc_corrected <= ecc_corrected_wire;
-                ecc_error     <= ecc_error_wire;
-
-                if (ecc_error_wire) begin
-                    state <= IDLE;
-                end else begin
-                    data_id    <= corr_data_id;
-                    word_count <= {corr_wc_msb, corr_wc_lsb};
-
-                    if ({corr_wc_msb, corr_wc_lsb} == 0) begin
-                        packet_done <= 1'b1;
-                        state <= IDLE;
+                S_HDR: begin
+                    if (!phy_valid) begin
+                        pkt_truncated <= 1'b1;
+                        state         <= S_IDLE;
                     end else begin
-                        // ✅ CRITICAL FIX: Output FIRST byte HERE before state transition!
-                        // At this moment, phy_byte IS the first payload byte
-                        if (phy_valid && m_axis_tready) begin
-                            m_axis_tdata  <= phy_byte;
-                            m_axis_tvalid <= 1'b1;
-                            byte_cnt      <= 1;  // We've output 1 byte
-                            
-                            if ({corr_wc_msb, corr_wc_lsb} == 1) begin
-                                // Only 1 byte in packet
-                                m_axis_tlast <= 1'b1;
-                                packet_done  <= 1'b1;
-                                idle_wait    <= 1'b1;
-                                state <= IDLE;
-                            end else begin
-                                state <= PAYLOAD;
+                        case (hdr_cnt)
+                            2'd1: begin
+                                hdr_b1  <= phy_byte;
+                                hdr_cnt <= 2'd2;
                             end
-                        end else begin
-                            // No phy_valid or not ready, go to PAYLOAD anyway
-                            byte_cnt <= 0;
-                            state <= PAYLOAD;
-                        end
+                            2'd2: begin
+                                hdr_b2  <= phy_byte;
+                                hdr_cnt <= 2'd3;
+                            end
+                            default: begin
+                                // 4th byte = ECC: check header
+                                ecc_corrected <= ecc_corr_w;
+                                if (ecc_err_w) begin
+                                    ecc_error <= 1'b1;
+                                    state     <= S_DISCARD;
+                                end else begin
+                                    data_id    <= hdr_di;
+                                    word_count <= hdr_wc;
+                                    if (!is_long) begin
+                                        if (hdr_di == DI_FS) begin
+                                            frame_start <= 1'b1;
+                                            sof_pending <= 1'b1;
+                                        end
+                                        if (hdr_di == DI_FE)
+                                            frame_end <= 1'b1;
+                                        state <= S_IDLE;
+                                    end else begin
+                                        wc_q       <= hdr_wc;
+                                        pay_cnt    <= 16'd0;
+                                        pend_valid <= 1'b0;
+                                        state      <= (hdr_wc == 16'd0) ? S_CRC_LSB : S_PAYLOAD;
+                                    end
+                                end
+                            end
+                        endcase
                     end
                 end
-            end
 
-            // ---------------- PAYLOAD ----------------
-            PAYLOAD: begin
-                // Output bytes directly from phy_byte
-                if (phy_valid && m_axis_tready && byte_cnt < word_count) begin
-                    m_axis_tdata  <= phy_byte;
-                    m_axis_tvalid <= 1'b1;
-                    byte_cnt      <= byte_cnt + 1;
-                    
-                    if (byte_cnt == word_count - 1) begin
-                        m_axis_tlast <= 1'b1;
-                        packet_done  <= 1'b1;
-                        idle_wait    <= 1'b1;  // ✅ Set wait flag
+                S_PAYLOAD: begin
+                    if (!phy_valid) begin
+                        // burst ended early: close the line as bad
+                        out_data      <= pend_data;
+                        out_valid     <= pend_valid;
+                        out_sof       <= pend_sof;
+                        out_last      <= pend_valid;
+                        out_err       <= pend_valid;
+                        pend_valid    <= 1'b0;
+                        pkt_truncated <= 1'b1;
+                        state         <= S_IDLE;
+                    end else begin
+                        // forward the previous byte, hold the new one
+                        out_data   <= pend_data;
+                        out_valid  <= pend_valid;
+                        out_sof    <= pend_sof;
+                        pend_data  <= phy_byte;
+                        pend_valid <= 1'b1;
+                        pend_sof   <= sof_pending;
+                        sof_pending <= 1'b0;
+                        pay_cnt    <= pay_cnt + 16'd1;
+                        if (pay_cnt == wc_q - 16'd1)
+                            state <= S_CRC_LSB;
                     end
                 end
 
-                // State transition independent of phy_valid
-                if (byte_cnt >= word_count) begin
-                    state <= IDLE;
+                S_CRC_LSB: begin
+                    if (!phy_valid) begin
+                        out_data      <= pend_data;
+                        out_valid     <= pend_valid;
+                        out_sof       <= pend_sof;
+                        out_last      <= pend_valid;
+                        out_err       <= pend_valid;
+                        pend_valid    <= 1'b0;
+                        pkt_truncated <= 1'b1;
+                        state         <= S_IDLE;
+                    end else begin
+                        crc_lsb <= phy_byte;
+                        state   <= S_CRC_MSB;
+                    end
                 end
-            end
 
+                S_CRC_MSB: begin
+                    // release the held last byte tagged with the CRC result
+                    out_data   <= pend_data;
+                    out_valid  <= pend_valid;
+                    out_sof    <= pend_sof;
+                    out_last   <= pend_valid;
+                    pend_valid <= 1'b0;
+                    state      <= S_IDLE;
+                    if (!phy_valid) begin
+                        out_err       <= pend_valid;
+                        pkt_truncated <= 1'b1;
+                    end else begin
+                        out_err   <= pend_valid && crc_bad;
+                        crc_error <= crc_bad;
+                        line_done <= 1'b1;
+                    end
+                end
+
+                // uncorrectable header: drop bytes until the burst ends
+                S_DISCARD: begin
+                    if (!phy_valid)
+                        state <= S_IDLE;
+                end
+
+                default: state <= S_IDLE;
             endcase
         end
     end
